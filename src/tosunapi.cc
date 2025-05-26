@@ -9,42 +9,66 @@
 #include <cstring>
 #include <TSCANDef.h>
 
-void ReceiveCANMessage(const TLibCAN *AData)
-{
-    if ((AData->FProperties & 0x1) == 1)
-    {
-        std::cout << "tx frame with id" << AData->FIdentifier << " on " << AData->FIdxChn << std::endl;
-    }
-    else
-    {
-        std::cout << "rx frame with id" << AData->FIdentifier << " on " << AData->FIdxChn << std::endl;
-    }
-}
+#include "tosunapi/thread_safe_queue.h"
+#include "tosunapi/can_msg.h"
 
-void ReceiveCANFDMessage(const TLibCANFD *AFDData)
-{
-    if ((AFDData->FProperties & 0x1) == 1)
-    {
-        std::cout << "tx CAN FD frame with id" << AFDData->FIdentifier << std::endl;
-    }
-    else
-    {
-        std::cout << "rx CAN FD frame with id " << AFDData->FIdentifier << std::endl;
-    }
-}
+namespace {
+
+constexpr uint8_t MASK_DIR_TX = 0x1;
+Tosun::ThreadSafeQue<std::unique_ptr<Tosun::CanMsg>, 100> threadSafeQue;
+
+} // namespace
 
 namespace Tosun {
 
-TosunApi::~TosunApi() {
-    // finalize_lib_tscan();
+void LibTscanWrapper::ConnectDevice() {
+    int expected = 0;
+    if (deviceCount_.compare_exchange_strong(expected, 1,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        initialize_lib_tscan(true, false, false);
+    } else {
+        deviceCount_.fetch_add(1, std::memory_order_acq_rel);
+    }
 }
 
-std::optional<TosunApi> TosunApi::LoadDevice(Callback canCb, Callback canFdCb) {
-    initialize_lib_tscan(true, false, false);
+void LibTscanWrapper::DisconnectDevice() {
+    int expected = 1;
+    if (deviceCount_.compare_exchange_strong(expected, 0,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        finalize_lib_tscan();
+    } else {
+        deviceCount_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+}
+
+TosunApi::TosunApi(Callback cb) : cb_(cb), deviceId_(UINT64_MAX) {
+    running_ = true;
+    auto process = [&]() {
+        while (running_) {
+            auto msg = threadSafeQue.Pop();
+            if (cb_ != nullptr) {
+                auto& data = msg->Data();
+                cb_(msg->Id(),data.data(), data.size());
+            }
+        }
+    };
+
+    msgProcessor_ = std::thread(process);
+}
+
+TosunApi::~TosunApi() {
+    running_ = false;
+    msgProcessor_.join();
+}
+
+TosunResult TosunApi::ConnectDevice() {
+    LibTscanWrapper::Instance().ConnectDevice();
     uint32_t deviceNum = 0;
     auto ret = tscan_scan_devices(&deviceNum);
     if (static_cast<TosunResult>(ret) != TosunResult::OK || deviceNum == 0) {
-        return std::nullopt;
+        return TosunResult::ERROR;
     }
 
     char* manufacturer = nullptr;
@@ -52,25 +76,45 @@ std::optional<TosunApi> TosunApi::LoadDevice(Callback canCb, Callback canFdCb) {
     char* serial = nullptr;
     ret = tscan_get_device_info(0, &manufacturer, &product, &serial);
     if (static_cast<TosunResult>(ret) != TosunResult::OK) {
-        return std::nullopt;
+        return TosunResult::ERROR;
     }
 
     uint64_t deviceId = 0;
     ret = tscan_connect(serial, &deviceId);
     if (static_cast<TosunResult>(ret) != TosunResult::OK && ret != static_cast<uint32_t>(TosunResult::CONNECTED)) {
-        return std::nullopt;
+        return TosunResult::FAILED_TO_CONNECT;
     }
 
-    ret = tscan_register_event_can(deviceId, ReceiveCANMessage);
+    auto canCallback = [](const TLibCAN *msg) {
+        if (!(msg->FProperties & MASK_DIR_TX)) {
+            auto canId = msg->FIdentifier;
+            const uint8_t *data = msg->FData;
+            uint8_t len = msg->FDLC;
+
+            auto canMsg = std::make_unique<CanMsg>(canId, data, len);
+            threadSafeQue.Push(std::move(canMsg));
+        }
+    };
+
+    ret = tscan_register_event_can(deviceId, canCallback);
     if (static_cast<TosunResult>(ret) != TosunResult::OK) {
         tscan_disconnect_by_handle(deviceId);
-        return std::nullopt;
+        return TosunResult::REGISTER_CAN_CALLBACK_FAIL;
     }
 
-    ret = tscan_register_event_canfd(deviceId, ReceiveCANFDMessage);
+    auto canfdCallback = [](const TLibCANFD* msg) {
+        if (!(msg->FProperties & MASK_DIR_TX)) {
+            auto canId = msg->FIdentifier;
+            const uint8_t *data = msg->FData;
+            uint8_t len = msg->FDLC;
+            auto canMsg = std::make_unique<CanMsg>(canId, data, len, true);
+            threadSafeQue.Push(std::move(canMsg));
+        }
+    };
+    ret = tscan_register_event_canfd(deviceId, canfdCallback);
     if (static_cast<TosunResult>(ret) != TosunResult::OK) {
         tscan_disconnect_by_handle(deviceId);
-        return std::nullopt;
+        return TosunResult::REGISTER_CANFD_CALLBACK_FAIL;
     }
 
     ret = tscan_configure_canfd_regs(deviceId, static_cast<APP_CHANNEL>(CHN1), 500, 63, 16, 1, 15, 2000,
@@ -79,14 +123,15 @@ std::optional<TosunApi> TosunApi::LoadDevice(Callback canCb, Callback canFdCb) {
               15, 4, 1, 3, lfdtISOCAN, lfdmNormal, 1, 0);
     if (static_cast<TosunResult>(ret) != TosunResult::OK) {
         tscan_disconnect_by_handle(deviceId);
-        return std::nullopt;
+        return TosunResult::CONFIGURE_FAIL;
     }
 
-    if (canFdCb != nullptr) {
-        throw std::runtime_error("CAN FD is not supported yet.");
-    }
+    deviceId_ = deviceId;
+    return TosunResult::OK;
+}
 
-    return TosunApi(deviceId, canCb);
+void TosunApi::DisconnectDevice() {
+    LibTscanWrapper::Instance().DisconnectDevice();
 }
 
 TosunResult TosunApi::SendSync(uint32_t canId, const std::vector<uint8_t>& data, uint32_t timeout) const {
