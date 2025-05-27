@@ -13,7 +13,7 @@ add_executable(${PROJECT_NAME} main.cc src/tosunapi.cc)
 target_include_directories(${PROJECT_NAME} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
-target_link_libraries(${PROJECT_NAME} PRIVATE tosunapi)
+target_link_libraries(${PROJECT_NAME} PRIVATE tosunapi pthread)
 
 install(TARGETS ${PROJECT_NAME}
         LIBRARY DESTINATION lib
